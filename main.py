@@ -29,6 +29,14 @@ is dropped rather than persisted, to keep this file's size bounded to
 roughly the number of companies genuinely worth a human's attention,
 not the much larger candidate backlog.
 
+A second, similarly small persistent store (data/psc_snapshots.json)
+holds each checked company's last-seen PSC "kind" counts (individual
+vs. corporate/legal-person), never names, so indicators.py can detect
+a change in PSC structure between runs. Unlike known_alerts.json, this
+one keeps an entry for every company ever checked, not just ones with
+a live alert, since a "currently no alert" company still needs its
+kind-counts remembered to detect next run's change.
+
 Usage:
     export CH_API_KEY="your_key_here"
     python main.py
@@ -97,8 +105,10 @@ def select_batch(flagged_companies, cursor_path, batch_size):
     return batch, next_index
 
 
-def load_known_alerts(path):
-    """Returns {company_number: [alert, ...]} from the persistent store."""
+def load_json_store(path):
+    """Returns the dict at `path`, or {} if it doesn't exist yet or is
+    unreadable. Generic loader shared by known_alerts.json (company_number
+    -> [alert, ...]) and psc_snapshots.json (company_number -> {kind: count})."""
     if not os.path.exists(path):
         return {}
     try:
@@ -108,24 +118,26 @@ def load_known_alerts(path):
         return {}
 
 
-def save_known_alerts(path, known_alerts):
+def save_json_store(path, data):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(known_alerts, f, indent=2)
+        json.dump(data, f, indent=2)
 
 
-def process_company(client, company_number):
+def process_company(client, company_number, previous_psc_snapshot=None):
     profile = client.company_profile(company_number)
     officers_response = client.officers(company_number)
     charges_response = client.charges(company_number)
     insolvency_response = client.insolvency(company_number)
-    alerts = run_all_detectors(
-        company_number, profile, officers_response, charges_response, insolvency_response
+    psc_response = client.persons_with_significant_control(company_number)
+    alerts, psc_snapshot = run_all_detectors(
+        company_number, profile, officers_response, charges_response,
+        insolvency_response, psc_response, previous_psc_snapshot,
     )
     company_name = (profile or {}).get("company_name", "")
     for alert in alerts:
         alert["company_name"] = company_name
-    return alerts
+    return alerts, psc_snapshot
 
 
 def main():
@@ -133,6 +145,7 @@ def main():
     parser.add_argument("--watchlist", default="watchlist.csv")
     parser.add_argument("--flagged-csv", default="data/flagged_companies.csv")
     parser.add_argument("--known-alerts", default="data/known_alerts.json")
+    parser.add_argument("--psc-snapshots", default="data/psc_snapshots.json")
     parser.add_argument("--cursor-file", default="data/detail_scan_cursor.json")
     parser.add_argument("--max-flagged-per-run", type=int, default=500,
                          help="Cap on how many bulk-flagged companies get the detailed "
@@ -149,7 +162,8 @@ def main():
 
     watchlist_companies = load_company_csv(args.watchlist)
     flagged_companies = load_company_csv(args.flagged_csv)
-    known_alerts = load_known_alerts(args.known_alerts)
+    known_alerts = load_json_store(args.known_alerts)
+    psc_snapshots = load_json_store(args.psc_snapshots)
 
     batch, next_cursor = select_batch(flagged_companies, args.cursor_file, args.max_flagged_per_run)
 
@@ -167,11 +181,15 @@ def main():
     for company_number in companies_to_check:
         print(f"Checking {company_number}...")
         try:
-            alerts = process_company(client, company_number)
+            alerts, psc_snapshot = process_company(
+                client, company_number, psc_snapshots.get(company_number)
+            )
         except Exception as e:
             print(f"  Error retrieving data for {company_number}: {e}", file=sys.stderr)
             continue
         checked_count += 1
+        if psc_snapshot:
+            psc_snapshots[company_number] = psc_snapshot
         if alerts:
             print(f"  {len(alerts)} alert(s) found.")
             known_alerts[company_number] = alerts
@@ -186,12 +204,13 @@ def main():
             f"{len(batch):,} checked this run, next run resumes at index {next_cursor}."
         )
 
-    save_known_alerts(args.known_alerts, known_alerts)
+    save_json_store(args.known_alerts, known_alerts)
+    save_json_store(args.psc_snapshots, psc_snapshots)
 
     all_alerts = [alert for alerts in known_alerts.values() for alert in alerts]
 
     fieldnames = [
-        "company_number", "company_name", "indicator", "detail",
+        "company_number", "company_name", "indicator", "tier", "detail",
         "evidence_url", "confidence", "detected_at",
     ]
     with open(args.output, "w", newline="", encoding="utf-8") as f:
