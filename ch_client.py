@@ -86,6 +86,12 @@ class CompaniesHouseClient:
     def insolvency(self, company_number):
         return self._get(f"/company/{company_number}/insolvency")
 
+    def persons_with_significant_control(self, company_number, items_per_page=100):
+        return self._get(
+            f"/company/{company_number}/persons-with-significant-control",
+            params={"items_per_page": items_per_page},
+        )
+
     def search_companies(self, query, items_per_page=20):
         return self._get(
             "/search/companies",
